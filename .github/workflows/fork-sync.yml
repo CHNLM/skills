@@ -1,0 +1,946 @@
+name: Fork仓库同步
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'          #
+  workflow_dispatch:              # 允许手动触发
+    inputs:
+      sync_mode:
+        description: '同步模式选择'
+        required: true
+        type: choice
+        default: 'main-only'
+        options:
+          - 'full'                # 完整同步（所有代码分支+标签+Releases）
+          - 'main-only'           # 仅同步主分支（main/master代码+标签+Releases）
+          - 'releases-only'       # 仅同步Releases（推荐，速度最快）
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write             # 必需：创建/删除 Release、标签和推送代码
+
+    env:
+      # 强制所有 JavaScript Actions 使用 Node.js 24，解决弃用警告
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      # 调试模式开关：true=输出详细调试日志，false=仅输出关键信息
+      DEBUG: false
+
+      # ============================================================
+      # 📌 核心配置区（必须根据实际情况修改）
+      # ============================================================
+
+      # 上游仓库地址（格式：所有者/仓库名，例如：microsoft/vscode）
+      UPSTREAM_REPO: "anthropics/skills"
+
+      # 同步模式（也受 workflow_dispatch 输入覆盖）
+      # "full"          = 完整同步（所有代码分支 + 标签 + Releases）
+      # "main-only"     = 仅同步主分支（默认分支代码 + 标签 + Releases）
+      # "releases-only" = 仅同步 Releases（推荐默认，速度最快，不影响本地代码）
+      SYNC_MODE: "main-only"
+
+      # 同步上游最新 N 个 Release（建议 10~20，加速同步，避免 API 限流）
+      SYNC_UPSTREAM_LATEST_N: 10
+
+      # 保留本地最新 N 个 Release（建议与同步数量一致，逻辑统一）
+      KEEP_LATEST_N_RELEASES: 10
+
+      # API 调用失败重试次数（建议 3~5，应对 GitHub API 临时波动）
+      API_RETRY_COUNT: 3
+
+      # ============================================================
+      # 📌 可选配置区（根据需求调整，默认值已优化）
+      # ============================================================
+
+      # 是否同步预发布（Pre-release）版本
+      # true  = 同步所有版本（正式版 + 预发布版）
+      # false = 仅同步正式版（推荐，更稳定）
+      SYNC_PRERELEASES: true
+
+      # 附件下载过滤模式
+      # 空字符串 "" 或 "*" = 下载所有附件
+      # 示例："*.apk *.zip" = 仅下载 APK 和 ZIP 文件
+      DOWNLOAD_PATTERNS: ""
+
+      # 自动清理旧 Release 开关
+      # true  = 自动删除超过保留数量的旧版本
+      # false = 保留所有同步的版本
+      AUTO_CLEAN_OLD_RELEASES: true
+
+      # 【仅 full 模式生效】是否强制覆盖本地已存在的分支
+      # true  = 强制覆盖（与上游完全一致）
+      # false = 仅同步本地不存在的分支（保护本地修改）
+      FORCE_OVERWRITE_BRANCHES: false
+
+      # 【仅 full 模式生效】是否清理上游已删除的分支
+      # true  = 删除本地已不存在于上游的分支（⚠️危险！会删除本地独有分支）
+      # false = 保留所有本地分支（默认，安全）
+      PRUNE_DELETED_BRANCHES: false
+
+      # 代码分支同步策略（控制如何将上游代码合并到 Fork）
+      # "merge" = git merge -X theirs（推荐）：合并保留 Fork 独有文件，与上游冲突时
+      #           以上游为准。适合绝大多数场景，你的自定义文件不会被覆盖
+      # "reset" = git reset --hard（强制覆盖）：完全覆盖，Fork 与上游完全一致
+      #           仅当你确定 Fork 不需要保留任何自有文件时使用
+      SYNC_STRATEGY: "merge"
+
+      # 自定义保留文件/目录路径（多个用空格分隔）
+      # 配合 merge 策略使用：merge 自动保留 Fork 独有的文件，此变量仅在 merge
+      # 出现意外故障时作为安全网回退（reset --hard → 恢复 fork 独有的文件）
+      # 也可指定单文件，如 ".github/workflows/fork-sync.yml"
+      # 注意：GitHub Actions 不支持 .github/workflows/ 子目录存放 workflow
+      PRESERVE_PATHS: ".github/workflows/fork-sync.yml"
+
+      # ============================================================
+      # 内部变量（请勿修改）
+      # ============================================================
+      GITHUB_API_BASE: "https://api.github.com"
+
+    steps:
+      # =========================================================================
+      # Step 0: 环境与配置验证 + 同步模式解析
+      # =========================================================================
+      - name: 🔍 环境与配置验证
+        id: validate
+        run: |
+          echo "=============================================="
+          echo "📋 开始环境与配置验证"
+          echo "=============================================="
+
+          # --- 解析最终同步模式 ---
+          INPUT_MODE="${{ github.event.inputs.sync_mode }}"
+          if [ -n "${INPUT_MODE}" ]; then
+            EFFECTIVE_MODE="${INPUT_MODE}"
+            echo "📌 检测到手动触发，同步模式由输入指定"
+          else
+            EFFECTIVE_MODE="${{ env.SYNC_MODE }}"
+            echo "📌 定时触发，使用 env 默认同步模式"
+          fi
+
+          case "${EFFECTIVE_MODE}" in
+            full|main-only|releases-only) ;;
+            *)
+              echo "❌ 错误：无效的同步模式 '${EFFECTIVE_MODE}'"
+              echo "💡 有效值：full / main-only / releases-only"
+              exit 1 ;;
+          esac
+          echo "SYNC_MODE=${EFFECTIVE_MODE}" >> "$GITHUB_ENV"
+
+          case "${{ env.SYNC_STRATEGY }}" in
+            merge|reset) ;;
+            *)
+              echo "❌ 错误：无效的同步策略 '${{ env.SYNC_STRATEGY }}'"
+              echo "💡 有效值：merge / reset"
+              exit 1 ;;
+          esac
+
+          # --- 验证必要环境变量 ---
+          if [ -z "${{ env.UPSTREAM_REPO }}" ] || [ "${{ env.UPSTREAM_REPO }}" = "所有者/仓库名" ]; then
+            echo "❌ 错误：UPSTREAM_REPO 未配置或仍为模板默认值"
+            echo "💡 请修改为实际的上游仓库地址（如 microsoft/vscode）"
+            exit 1
+          fi
+
+          for var_name in SYNC_UPSTREAM_LATEST_N KEEP_LATEST_N_RELEASES API_RETRY_COUNT; do
+            val="${!var_name}"
+            if ! echo "${val}" | grep -qE '^[1-9][0-9]*$'; then
+              echo "❌ 错误：${var_name} 必须是正整数，当前值：${val}"
+              exit 1
+            fi
+          done
+
+          if [ -z "${{ env.PRESERVE_PATHS }}" ]; then
+            echo "⚠️ 警告：PRESERVE_PATHS 为空，将不会保留任何自定义文件"
+            echo "💡 如需保留自定义文件（如 workflow），请设置 PRESERVE_PATHS=\".github/workflows/\""
+          fi
+
+          if [ -z "${{ secrets.SYNC_PAT }}" ]; then
+            echo "❌ 错误：未找到 SYNC_PAT 令牌"
+            echo "💡 请在仓库 Settings → Secrets → Actions 中添加名为 SYNC_PAT 的个人访问令牌"
+            echo "💡 令牌需要勾选 repo 和 read:org 权限"
+            exit 1
+          fi
+
+          # --- 输出配置摘要 ---
+          echo "✅ 配置验证全部通过"
+          echo "--------------------------------------------------------------"
+          echo "📌 上游仓库：         ${{ env.UPSTREAM_REPO }}"
+          case "${EFFECTIVE_MODE}" in
+            full)          echo "📌 同步模式：         完整同步（所有分支+标签+Releases）" ;;
+            main-only)     echo "📌 同步模式：         主分支同步（默认分支+标签+Releases）" ;;
+            releases-only) echo "📌 同步模式：         仅同步 Releases" ;;
+          esac
+          echo "📌 同步最新 Release 数：${{ env.SYNC_UPSTREAM_LATEST_N }}"
+          echo "📌 保留本地 Release 数：${{ env.KEEP_LATEST_N_RELEASES }}"
+          echo "📌 同步预发布版本：     ${{ env.SYNC_PRERELEASES }}"
+          echo "📌 自动清理旧版本：     ${{ env.AUTO_CLEAN_OLD_RELEASES }}"
+          echo "📌 同步策略：           ${{ env.SYNC_STRATEGY }}"
+          echo "📌 保留自定义路径：     ${{ env.PRESERVE_PATHS }}"
+          echo "📌 强制覆盖分支：       ${{ env.FORCE_OVERWRITE_BRANCHES }}"
+          echo "📌 清理已删除分支：     ${{ env.PRUNE_DELETED_BRANCHES }}"
+          echo "=============================================="
+
+          echo "0" > /tmp/error_count.txt
+
+      # =========================================================================
+      # Step 1: 检出本地仓库
+      # =========================================================================
+      - name: 📥 检出本地仓库
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      # =========================================================================
+      # Step 2: 配置 Git 和 GitHub CLI 环境
+      # =========================================================================
+      - name: ⚙️ 配置 Git 和 GitHub CLI 环境
+        id: setup
+        run: |
+          echo "=============================================="
+          echo "📍 配置 Git 和 GitHub CLI 环境"
+          echo "=============================================="
+
+          git config --global user.name   "CHNLM"
+          git config --global user.email  "lmmails@163.com"
+          git config --global core.autocrlf      false
+          git config --global pull.rebase        false
+          git config --global http.postBuffer    524288000
+
+          # gh CLI 原生支持 GITHUB_TOKEN 环境变量，无需额外 gh auth login
+          export GITHUB_TOKEN="${{ secrets.SYNC_PAT }}"
+          echo "GITHUB_TOKEN=${GITHUB_TOKEN}" >> "$GITHUB_ENV"
+
+          echo "📌 GitHub CLI 版本：$(gh --version | head -n1)"
+          echo "📌 认证方式：GITHUB_TOKEN 环境变量（gh CLI 原生支持）"
+
+          echo "🔍 测试上游仓库 API 连接..."
+          API_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "${GITHUB_API_BASE}/repos/${{ env.UPSTREAM_REPO }}")
+
+          HTTP_CODE=$(echo "${API_RESPONSE}" | tail -n1)
+          RESPONSE_BODY=$(echo "${API_RESPONSE}" | head -n -1)
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "❌ GitHub API 连接失败，HTTP 状态码：${HTTP_CODE}"
+            echo "📄 响应内容：${RESPONSE_BODY}"
+            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+            exit 1
+          fi
+
+          REPO_FULL_NAME=$(echo "${RESPONSE_BODY}"  | jq -r '.full_name')
+          REPO_PRIVATE=$(echo "${RESPONSE_BODY}"    | jq -r '.private')
+          DEFAULT_BRANCH=$(echo "${RESPONSE_BODY}"  | jq -r '.default_branch')
+
+          echo "REPO_FULL_NAME=${REPO_FULL_NAME}"   >> "$GITHUB_ENV"
+          echo "REPO_PRIVATE=${REPO_PRIVATE}"       >> "$GITHUB_ENV"
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}"   >> "$GITHUB_ENV"
+
+          echo "✅ GitHub API 连接成功"
+          echo "📌 上游仓库全称：  ${REPO_FULL_NAME}"
+          echo "📌 仓库类型：      $([ "${REPO_PRIVATE}" = "true" ] && echo '私有仓库' || echo '公共仓库')"
+          echo "📌 默认分支：      ${DEFAULT_BRANCH}"
+          echo "=============================================="
+
+      # =========================================================================
+      # Step 3: 同步上游代码分支（仅在 full / main-only 模式下执行）
+      # =========================================================================
+      - name: 🔄 同步上游代码分支
+        if: ${{ env.SYNC_MODE == 'full' || env.SYNC_MODE == 'main-only' }}
+        run: |
+          echo "=============================================="
+          echo "🎯 代码分支同步：模式 = ${{ env.SYNC_MODE }}"
+          echo "=============================================="
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+
+          if [ "${{ env.SYNC_MODE }}" = "main-only" ]; then
+            # ---- 主分支模式：仅 fetch 默认分支 + 所有标签 ----
+            TARGET_BRANCH="${{ env.DEFAULT_BRANCH }}"
+            echo "📥 获取上游默认分支（${TARGET_BRANCH}）+ 所有标签..."
+            FETCH_SUCCESS=false
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              if git fetch upstream "refs/heads/${TARGET_BRANCH}:refs/remotes/upstream/${TARGET_BRANCH}" --tags --prune --prune-tags 2>/dev/null; then
+                FETCH_SUCCESS=true; break
+              fi
+              echo "⚠️ 获取失败，第 ${i} 次重试..."
+              if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+            done
+
+            if [ "${FETCH_SUCCESS}" = "false" ]; then
+              echo "❌ 获取上游默认分支失败"
+              echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+              exit 0
+            fi
+            echo "✅ 默认分支获取成功"
+
+            SYNCED_BRANCHES=0; FAILED_BRANCHES=0
+            echo "----------------------------------------------"
+            echo "🔄 同步分支：${TARGET_BRANCH}"
+            echo "📌 同步策略：${{ env.SYNC_STRATEGY }}"
+
+            # ---- 备份需要保留的自定义文件（merge 失败时安全网） ----
+            PRESERVE_DIR=$(mktemp -d)
+            PRESERVE_COUNT=0
+            for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+              if [ -d "${preserve_path}" ] || [ -f "${preserve_path}" ]; then
+                target_dir="${PRESERVE_DIR}/$(dirname "${preserve_path}")"
+                mkdir -p "${target_dir}"
+                cp -r "${preserve_path}" "${PRESERVE_DIR}/${preserve_path}" 2>/dev/null && \
+                  echo "  📦 已备份: ${preserve_path}" && \
+                  PRESERVE_COUNT=$((PRESERVE_COUNT + 1)) || \
+                  echo "  ⚠️ 备份失败: ${preserve_path}"
+              fi
+            done
+            if [ "${PRESERVE_COUNT}" -gt 0 ]; then
+              echo "✅ 已备份 ${PRESERVE_COUNT} 个自定义路径"
+            else
+              echo "ℹ️ 没有需要备份的自定义路径"
+            fi
+
+            if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
+              echo "⚠️ 本地分支 ${TARGET_BRANCH} 已存在"
+
+              if [ "${{ env.SYNC_STRATEGY }}" = "merge" ]; then
+                # ---- merge 策略：git merge upstream（默认，推荐） ----
+                # 效果：上游更新正常传入，Fork 独有文件被保留
+                echo "🔀 使用 git merge 策略（保留 Fork 独有文件，上游冲突以上游为准）..."
+                git checkout "${TARGET_BRANCH}"
+                MERGE_SUCCESS=false
+                if git merge "upstream/${TARGET_BRANCH}" -X theirs --no-edit 2>/dev/null; then
+                  MERGE_SUCCESS=true
+                  echo "✅ git merge 成功（Fork 独有文件已自动保留）"
+                else
+                  echo "⚠️ git merge 失败（可能存在冲突），回退到 reset + 智能恢复..."
+                  git merge --abort 2>/dev/null || true
+                  git reset --hard "upstream/${TARGET_BRANCH}"
+                  echo "🔄 已回退为 reset --hard，将执行智能恢复..."
+                fi
+              else
+                # ---- reset 策略：完全覆盖为上游版本（旧行为） ----
+                echo "🔄 使用 reset 策略（完全覆盖为上游版本）..."
+                git checkout "${TARGET_BRANCH}"
+                git reset --hard "upstream/${TARGET_BRANCH}"
+                MERGE_SUCCESS=false
+              fi
+            else
+              echo "📥 创建新分支 ${TARGET_BRANCH}（首次同步）..."
+              git checkout -b "${TARGET_BRANCH}" "upstream/${TARGET_BRANCH}"
+              MERGE_SUCCESS=true
+            fi
+
+            if [ $? -ne 0 ]; then
+              echo "❌ 分支 ${TARGET_BRANCH} 操作失败"
+              FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+            else
+              # ---- 智能恢复（仅 merge 失败/未 merge 时执行，fork 独有文件） ----
+              if [ "${MERGE_SUCCESS}" != "true" ] && [ -d "${PRESERVE_DIR}" ] && [ "${PRESERVE_COUNT}" -gt 0 ]; then
+                echo "----------------------------------------------"
+                echo "📦 智能恢复：仅恢复上游中不存在的 Fork 独有文件..."
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  backup_item="${PRESERVE_DIR}/${preserve_path}"
+                  if [ -d "${backup_item}" ]; then
+                    while IFS= read -r f; do
+                      relative="${f#${PRESERVE_DIR}/}"
+                      if [ ! -e "${relative}" ]; then
+                        dir=$(dirname "${relative}")
+                        mkdir -p "${dir}"
+                        cp "${f}" "${relative}" 2>/dev/null && \
+                          echo "  ✅ 已恢复: ${relative}（上游无此文件）"
+                      fi
+                    done < <(find "${backup_item}" -type f 2>/dev/null)
+                  elif [ -f "${backup_item}" ]; then
+                    if [ ! -e "${preserve_path}" ]; then
+                      mkdir -p "$(dirname "${preserve_path}")"
+                      cp "${backup_item}" "${preserve_path}" 2>/dev/null && \
+                        echo "  ✅ 已恢复: ${preserve_path}（上游无此文件）"
+                    fi
+                  fi
+                done
+                git add -A
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: preserve fork-only custom files after upstream sync [skip ci]" || true
+                  echo "✅ Fork 独有文件已提交"
+                else
+                  echo "ℹ️ 没有需要恢复的文件"
+                fi
+              fi
+
+              PUSH_SUCCESS=false
+              for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+                if git push origin "${TARGET_BRANCH}" --force-with-lease; then
+                  PUSH_SUCCESS=true; break
+                fi
+                echo "⚠️ 推送 ${TARGET_BRANCH} 失败，第 ${i} 次重试..."
+                if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+              done
+              if [ "${PUSH_SUCCESS}" = "true" ]; then
+                echo "✅ 分支 ${TARGET_BRANCH} 同步成功"
+                SYNCED_BRANCHES=$((SYNCED_BRANCHES + 1))
+              else
+                echo "❌ 推送 ${TARGET_BRANCH} 最终失败"
+                FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+              fi
+            fi
+            rm -rf "${PRESERVE_DIR}"
+
+          else
+            # ---- 完整模式：fetch 所有分支 + 所有标签 ----
+            echo "📥 获取上游所有分支和标签..."
+            FETCH_SUCCESS=false
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              if git fetch upstream --tags --prune --prune-tags; then
+                FETCH_SUCCESS=true; break
+              fi
+              echo "⚠️ 获取上游全部分支失败，第 ${i} 次重试..."
+              if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+            done
+
+            if [ "${FETCH_SUCCESS}" = "false" ]; then
+              echo "❌ 获取上游全部分支最终失败"
+              echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+              exit 0
+            fi
+
+            UPSTREAM_BRANCHES=$(git branch -r | grep 'upstream/' | grep -v 'HEAD' | sed 's/^[[:space:]]*//')
+            BRANCH_COUNT=$(echo "${UPSTREAM_BRANCHES}" | grep -c .)
+            echo "✅ 找到上游 ${BRANCH_COUNT} 个分支"
+
+            SYNCED_BRANCHES=0; SKIPPED_BRANCHES=0; FAILED_BRANCHES=0
+            for branch in ${UPSTREAM_BRANCHES}; do
+              branch_name="${branch#upstream/}"
+              [ -z "${branch_name}" ] && continue
+              echo "----------------------------------------------"
+              echo "🔄 处理分支：${branch_name}"
+
+              # ---- 判断是否为默认分支，默认分支需要备份自定义文件 ----
+              IS_DEFAULT=false
+              PRESERVE_DIR=""
+              if [ "${branch_name}" = "${{ env.DEFAULT_BRANCH }}" ]; then
+                IS_DEFAULT=true
+                PRESERVE_DIR=$(mktemp -d)
+                PRESERVE_COUNT=0
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  if [ -d "${preserve_path}" ] || [ -f "${preserve_path}" ]; then
+                    target_dir="${PRESERVE_DIR}/$(dirname "${preserve_path}")"
+                    mkdir -p "${target_dir}"
+                    cp -r "${preserve_path}" "${PRESERVE_DIR}/${preserve_path}" 2>/dev/null && \
+                      echo "  📦 已备份: ${preserve_path}" && \
+                      PRESERVE_COUNT=$((PRESERVE_COUNT + 1)) || \
+                      echo "  ⚠️ 备份失败: ${preserve_path}"
+                  fi
+                done
+                if [ "${PRESERVE_COUNT}" -gt 0 ]; then
+                  echo "✅ 已备份 ${PRESERVE_COUNT} 个自定义路径"
+                else
+                  echo "ℹ️ 没有需要备份的自定义路径"
+                fi
+              fi
+
+              if git show-ref --verify --quiet "refs/heads/${branch_name}"; then
+                if [ "${{ env.FORCE_OVERWRITE_BRANCHES }}" = "true" ]; then
+                  echo "⚠️ 本地分支已存在，强制覆盖..."
+
+                  if [ "${IS_DEFAULT}" = "true" ] && [ "${{ env.SYNC_STRATEGY }}" = "merge" ]; then
+                    echo "🔀 默认分支使用 git merge 策略..."
+                    if git checkout "${branch_name}" && \
+                       git merge "upstream/${branch_name}" -X theirs --no-edit 2>/dev/null; then
+                      MERGE_SUCCESS=true
+                      echo "✅ git merge 成功（Fork 独有文件已自动保留）"
+                    else
+                      echo "⚠️ git merge 失败，回退到 reset + 智能恢复..."
+                      git merge --abort 2>/dev/null || true
+                      git checkout -B "${branch_name}" "upstream/${branch_name}" || {
+                        echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                        FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                      }
+                      MERGE_SUCCESS=false
+                    fi
+                  elif [ "${IS_DEFAULT}" = "true" ]; then
+                    echo "🔄 默认分支使用 reset 策略..."
+                    if ! git checkout -B "${branch_name}" "upstream/${branch_name}"; then
+                      echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                      FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                    fi
+                    MERGE_SUCCESS=false
+                  else
+                    if ! git checkout -B "${branch_name}" "upstream/${branch_name}"; then
+                      echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                      FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                    fi
+                    MERGE_SUCCESS=true
+                  fi
+                else
+                  echo "⏭️ 本地分支已存在，跳过（如需覆盖请设置 FORCE_OVERWRITE_BRANCHES=true）"
+                  SKIPPED_BRANCHES=$((SKIPPED_BRANCHES + 1))
+                  [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
+                  continue
+                fi
+              else
+                echo "📥 创建并同步新分支..."
+                if ! git checkout -b "${branch_name}" "upstream/${branch_name}"; then
+                  echo "❌ 创建分支 ${branch_name} 失败"
+                  FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+                  [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
+                  continue
+                fi
+                MERGE_SUCCESS=true
+              fi
+
+              # ---- 默认分支：智能恢复 Fork 独有文件（仅 merge 失败时执行） ----
+              if [ "${IS_DEFAULT}" = "true" ] && [ "${MERGE_SUCCESS}" != "true" ] && [ -d "${PRESERVE_DIR}" ]; then
+                RESTORED_COUNT=0
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  backup_item="${PRESERVE_DIR}/${preserve_path}"
+                  if [ -d "${backup_item}" ]; then
+                    while IFS= read -r f; do
+                      relative="${f#${PRESERVE_DIR}/}"
+                      if [ ! -e "${relative}" ]; then
+                        dir=$(dirname "${relative}")
+                        mkdir -p "${dir}"
+                        cp "${f}" "${relative}" 2>/dev/null && \
+                          echo "  ✅ 已恢复: ${relative}（上游无此文件）"
+                      fi
+                    done < <(find "${backup_item}" -type f 2>/dev/null)
+                  elif [ -f "${backup_item}" ]; then
+                    if [ ! -e "${preserve_path}" ]; then
+                      mkdir -p "$(dirname "${preserve_path}")"
+                      cp "${backup_item}" "${preserve_path}" 2>/dev/null && \
+                        echo "  ✅ 已恢复: ${preserve_path}（上游无此文件）"
+                    fi
+                  fi
+                done
+                git add -A
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: preserve fork-only custom files after upstream sync [skip ci]" || true
+                  echo "✅ Fork 独有文件已提交"
+                else
+                  echo "ℹ️ 没有需要恢复的文件"
+                fi
+              fi
+
+              echo "📤 推送到本地仓库..."
+              PUSH_SUCCESS=false
+              for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+                if git push origin "${branch_name}"; then
+                  PUSH_SUCCESS=true; break
+                fi
+                echo "⚠️ 推送 ${branch_name} 失败，第 ${i} 次重试..."
+                if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+              done
+              if [ "${PUSH_SUCCESS}" = "true" ]; then
+                echo "✅ 分支 ${branch_name} 同步成功"
+                SYNCED_BRANCHES=$((SYNCED_BRANCHES + 1))
+              else
+                echo "❌ 推送 ${branch_name} 最终失败"
+                FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+              fi
+
+              [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
+            done
+
+            if [ "${{ env.PRUNE_DELETED_BRANCHES }}" = "true" ]; then
+              echo "----------------------------------------------"
+              echo "🔄 清理上游已删除的本地分支..."
+              git fetch origin --prune
+              DEFAULT_BR="${{ env.DEFAULT_BRANCH }}"
+              CURRENT_BR="$(git rev-parse --abbrev-ref HEAD)"
+              LOCAL_BRANCHES=$(git branch --format '%(refname:short)')
+              for branch in ${LOCAL_BRANCHES}; do
+                if [ "${branch}" = "${DEFAULT_BR}" ] || [ "${branch}" = "${CURRENT_BR}" ]; then continue; fi
+                if ! git show-ref --verify --quiet "refs/remotes/upstream/${branch}"; then
+                  echo "🗑️ 删除本地孤立分支：${branch}"
+                  git branch -D "${branch}" 2>/dev/null || true
+                fi
+              done
+              echo "✅ 分支清理完成"
+            fi
+          fi
+
+          # ---- 同步标签 ----
+          echo "----------------------------------------------"
+          echo "🔄 同步所有标签..."
+          TAG_PUSH_SUCCESS=false; FAILED_TAGS=0
+          for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+            if git push origin --tags --force; then
+              TAG_PUSH_SUCCESS=true; break
+            fi
+            echo "⚠️ 同步标签失败，第 ${i} 次重试..."
+            if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+          done
+          if [ "${TAG_PUSH_SUCCESS}" = "false" ]; then
+            echo "❌ 同步标签最终失败"
+            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+            FAILED_TAGS=1
+          else
+            echo "✅ 标签同步成功"
+          fi
+
+          echo "=============================================="
+          echo "📊 代码分支同步总结"
+          echo "=============================================="
+          echo "✅ 成功同步：${SYNCED_BRANCHES} 个分支"
+          if [ "${{ env.SYNC_MODE }}" = "full" ]; then
+            echo "⏭️ 跳过：    ${SKIPPED_BRANCHES} 个分支"
+          fi
+          echo "❌ 失败：    ${FAILED_BRANCHES} 个分支"
+          if [ "${FAILED_TAGS}" -eq 0 ]; then echo "🏷️ 标签同步：成功"
+          else echo "🏷️ 标签同步：失败"; fi
+          echo "=============================================="
+
+      # =========================================================================
+      # Step 4: 同步上游 Releases（所有模式均执行）
+      # =========================================================================
+      - name: 📦 同步上游 Releases
+        run: |
+          echo "=============================================="
+          echo "📦 开始同步上游 Releases"
+          echo "=============================================="
+
+          trap 'rm -rf ./temp_assets_* /tmp/release_stats.txt /tmp/releases.txt' EXIT
+          printf '0\n0\n0\n' > /tmp/release_stats.txt
+
+          # =============================================================
+          # 阶段 A：获取上游 Release 列表（双层降级策略）
+          # =============================================================
+          UPSTREAM_RELEASES=""
+          echo "🔍 正在获取上游最新 ${{ env.SYNC_UPSTREAM_LATEST_N }} 个 Release..."
+
+          for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+            echo "🔄 第 ${i} 次尝试（API 直连）..."
+            API_RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "${GITHUB_API_BASE}/repos/${{ env.UPSTREAM_REPO }}/releases?per_page=${{ env.SYNC_UPSTREAM_LATEST_N }}&page=1")
+            HTTP_CODE=$(echo "${API_RESPONSE}" | tail -n1)
+            RESPONSE_BODY=$(echo "${API_RESPONSE}" | head -n -1)
+            if [ "${HTTP_CODE}" = "200" ]; then
+              UPSTREAM_RELEASES="${RESPONSE_BODY}"
+              echo "✅ API 获取成功"; break
+            fi
+            echo "⚠️ API 失败（HTTP ${HTTP_CODE}）"
+            if [ "${{ env.DEBUG }}" = "true" ]; then echo "📄 响应：${RESPONSE_BODY}"; fi
+            if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then echo "⏳ 等待 5 秒后重试..."; sleep 5; fi
+          done
+
+          if [ -z "${UPSTREAM_RELEASES}" ]; then
+            echo "⚠️ API 方案失败，尝试 gh CLI 备用方案..."
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              echo "🔄 第 ${i} 次尝试（gh CLI）..."
+              CLI_OUTPUT=$(gh release list \
+                --repo "${{ env.UPSTREAM_REPO }}" \
+                --limit "${{ env.SYNC_UPSTREAM_LATEST_N }}" \
+                --json tagName,name,body,isPrerelease,publishedAt 2>&1)
+              EXIT_CODE=$?
+              if [ ${EXIT_CODE} -eq 0 ] && [ -n "${CLI_OUTPUT}" ]; then
+                UPSTREAM_RELEASES="${CLI_OUTPUT}"
+                echo "✅ gh CLI 获取成功"; break
+              fi
+              echo "⚠️ gh CLI 失败（退出码 ${EXIT_CODE}）"
+              if [ "${{ env.DEBUG }}" = "true" ]; then echo "📄 输出：${CLI_OUTPUT}"; fi
+              if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then echo "⏳ 等待 5 秒后重试..."; sleep 5; fi
+            done
+          fi
+
+          if [ -z "${UPSTREAM_RELEASES}" ] || [ "${UPSTREAM_RELEASES}" = "[]" ]; then
+            echo "⚠️ 未能获取到上游 Release 列表"
+            echo "💡 可能原因：1.上游无Release 2.网络/API限流 3.PAT权限不足"
+            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+            exit 0
+          fi
+
+          RELEASE_COUNT=$(echo "${UPSTREAM_RELEASES}" | jq 'length')
+          echo "✅ 成功获取上游 ${RELEASE_COUNT} 个 Release"
+
+          # =========================================================================
+          # V5 关键：按发布时间 升序排列（最旧→最新），而非 API 默认的降序
+          #
+          # 原因：GitHub Fork 首页显示的 "Latest Release" 是最后创建的那个。
+          #       如果按 API 返回的降序（最新优先）同步，最后创建的是最旧版本，
+          #       Fork 首页会显示错误的 "最新 Release"。
+          #
+          # 修复：`sort_by(.published_at // .publishedAt)` 升序排列，
+          #       确保最新 Release 最后创建 → 正确显示在 Fork 首页。
+          #       `//` 运算符同时兼容 API (.published_at) 和 gh CLI (.publishedAt)
+          # =========================================================================
+          echo "${UPSTREAM_RELEASES}" | jq -c 'sort_by(.published_at // .publishedAt)[]' > /tmp/releases.txt
+
+          # =============================================================
+          # 阶段 B：逐 Release 同步
+          # =============================================================
+
+          increment_stat() {
+            local _line="$1"; local _val
+            _val=$(sed -n "${_line}p" /tmp/release_stats.txt)
+            sed -i "${_line}c\\$((_val + 1))" /tmp/release_stats.txt
+          }
+
+          # 规则：所有 gh 命令必须显式 --repo
+          #   --repo "${{ env.UPSTREAM_REPO }}" → 从上游下载/查询
+          #   --repo "${{ github.repository }}" → 在 Fork 创建/删除
+          download_with_retry() {
+            local _pattern="$1" _tag="$2" _dir="$3" _success=false
+            for _i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              if [ -n "${_pattern}" ]; then
+                if gh release download "${_tag}" --repo "${{ env.UPSTREAM_REPO }}" \
+                  --pattern "${_pattern}" --dir "${_dir}" 2>/dev/null; then
+                  _success=true; break
+                fi
+              else
+                if gh release download "${_tag}" --repo "${{ env.UPSTREAM_REPO }}" \
+                  --dir "${_dir}" 2>/dev/null; then
+                  _success=true; break
+                fi
+              fi
+              echo "⚠️ 下载失败，第 ${_i} 次重试..."
+              if [ ${_i} -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+            done
+            [ "${_success}" = "true" ] && return 0 || return 1
+          }
+
+          while IFS= read -r release; do
+            tag=$(echo "${release}"          | jq -r '.tag_name    // .tagName      // ""')
+            name=$(echo "${release}"         | jq -r '.name        // ""')
+            body=$(echo "${release}"         | jq -r '.body        // ""')
+            is_prerelease=$(echo "${release}"| jq -r '.prerelease  // .isPrerelease // false')
+            published_at=$(echo "${release}" | jq -r '.published_at // .publishedAt // ""')
+
+            [ -z "${tag}" ] && continue
+
+            echo "----------------------------------------------"
+            echo "🔄 处理 Release：${tag}"
+            echo "📌 名称：     ${name}"
+            echo "📅 发布时间： ${published_at}"
+            echo "📌 预发布：   ${is_prerelease}"
+
+            if [ "${{ env.SYNC_PRERELEASES }}" = "false" ] && [ "${is_prerelease}" = "true" ]; then
+              echo "⏭️ 跳过预发布版本"; increment_stat 2; continue
+            fi
+
+            # ---- 清理已存在的同名 Release（三重保障） ----
+            echo "🗑️ 检查并清理已存在的 Release 和标签..."
+            if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "⚠️ 发现同名 Release，正在删除..."
+              DELETE_SUCCESS=false
+              for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+                if gh release delete "${tag}" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null; then
+                  DELETE_SUCCESS=true; break
+                fi
+                echo "⚠️ 删除失败，第 ${i} 次重试..."
+                if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+              done
+              [ "${DELETE_SUCCESS}" = "false" ] && echo "⚠️ gh release delete 未成功，继续手动清理..."
+            fi
+            git tag -d "${tag}" 2>/dev/null || true
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              git push origin --delete "${tag}" 2>/dev/null && break
+              sleep 2
+            done
+            echo "✅ 标签和 Release 清理完成"
+
+            # ---- 下载附件 ----
+            ASSET_DIR="temp_assets_${tag}"; mkdir -p "${ASSET_DIR}"
+            echo "📥 开始下载附件..."
+
+            if [ -n "${{ env.DOWNLOAD_PATTERNS }}" ]; then
+              echo "📌 过滤模式：${{ env.DOWNLOAD_PATTERNS }}"
+              for pattern in ${{ env.DOWNLOAD_PATTERNS }}; do
+                echo "📥 下载匹配 ${pattern} 的文件..."
+                if ! download_with_retry "${pattern}" "${tag}" "${ASSET_DIR}"; then
+                  echo "⚠️ 部分文件下载可能失败"
+                fi
+              done
+            else
+              echo "📌 下载全部附件..."
+              if ! download_with_retry "" "${tag}" "${ASSET_DIR}"; then
+                echo "⚠️ 附件下载失败（将尝试创建空 Release）"
+              fi
+            fi
+
+            FILE_COUNT=$(find "${ASSET_DIR}" -type f 2>/dev/null | wc -l)
+            if [ "${FILE_COUNT}" -eq 0 ]; then echo "⚠️ 没有下载到任何附件"
+            else
+              echo "✅ 下载完成，共 ${FILE_COUNT} 个文件"
+              if [ "${{ env.DEBUG }}" = "true" ]; then echo "📄 文件列表："; ls -lh "${ASSET_DIR}"; fi
+            fi
+
+            # ---- 创建本地 Release（显式 --repo Fork） ----
+            echo "🚀 创建本地 Release..."
+            CREATE_SUCCESS=false
+            shopt -s nullglob; FILES=("${ASSET_DIR}"/*); shopt -u nullglob
+
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              PRERELEASE_FLAG=""
+              [ "${is_prerelease}" = "true" ] && PRERELEASE_FLAG="--prerelease"
+              if [ "${FILE_COUNT}" -eq 0 ] || [ ${#FILES[@]} -eq 0 ]; then
+                if gh release create "${tag}" --repo "${{ github.repository }}" \
+                  --title "${name}" --notes "${body}" ${PRERELEASE_FLAG}; then
+                  CREATE_SUCCESS=true; break
+                fi
+              else
+                if gh release create "${tag}" --repo "${{ github.repository }}" \
+                  --title "${name}" --notes "${body}" ${PRERELEASE_FLAG} "${FILES[@]}"; then
+                  CREATE_SUCCESS=true; break
+                fi
+              fi
+              echo "⚠️ 创建 Release 失败，第 ${i} 次重试..."
+              if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+            done
+
+            rm -rf "${ASSET_DIR}"
+
+            if [ "${CREATE_SUCCESS}" = "false" ]; then
+              echo "❌ 创建 Release 最终失败"; increment_stat 3; continue
+            fi
+            echo "✅ Release ${tag} 同步成功"; increment_stat 1
+
+          done < /tmp/releases.txt
+
+          SYNCED_RELEASES=$(sed -n '1p' /tmp/release_stats.txt)
+          SKIPPED_RELEASES=$(sed -n '2p' /tmp/release_stats.txt)
+          FAILED_RELEASES=$(sed -n '3p' /tmp/release_stats.txt)
+
+          echo "=============================================="
+          echo "📊 Releases 同步总结"
+          echo "=============================================="
+          echo "✅ 成功同步：${SYNCED_RELEASES} 个 Release"
+          echo "⏭️ 跳过：    ${SKIPPED_RELEASES} 个 Release"
+          echo "❌ 失败：    ${FAILED_RELEASES} 个 Release"
+          echo "=============================================="
+
+          if [ "${FAILED_RELEASES}" -gt 0 ]; then
+            echo $(( $(cat /tmp/error_count.txt) + FAILED_RELEASES )) > /tmp/error_count.txt
+          fi
+
+      # =========================================================================
+      # Step 5: 自动清理旧 Release（可配置开关）
+      # =========================================================================
+      - name: 🧹 自动清理旧 Releases
+        if: ${{ env.AUTO_CLEAN_OLD_RELEASES == 'true' }}
+        run: |
+          echo "=============================================="
+          echo "🧹 开始自动清理旧 Releases"
+          echo "📌 保留最新 ${{ env.KEEP_LATEST_N_RELEASES }} 个"
+          echo "=============================================="
+
+          echo "🔍 获取本地所有 Release（分页模式，无数量限制）..."
+          ALL_RELEASES="[]"; GET_SUCCESS=false
+
+          for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+            HAS_MORE=true; PAGE=1
+            while [ "${HAS_MORE}" = "true" ]; do
+              API_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "${GITHUB_API_BASE}/repos/${{ github.repository }}/releases?per_page=100&page=${PAGE}")
+              HTTP_CODE=$(echo "${API_RESPONSE}" | tail -n1)
+              PAGE_RELEASES=$(echo "${API_RESPONSE}" | head -n -1)
+              if [ "${HTTP_CODE}" != "200" ]; then echo "⚠️ 第 ${PAGE} 页获取失败"; HAS_MORE=false; break; fi
+              PAGE_COUNT=$(echo "${PAGE_RELEASES}" | jq 'length')
+              if [ "${PAGE_COUNT}" -eq 0 ]; then GET_SUCCESS=true; HAS_MORE=false; break; fi
+              ALL_RELEASES=$(echo "${ALL_RELEASES}" | jq --argjson page "${PAGE_RELEASES}" '. + $page')
+              PAGE=$((PAGE + 1))
+            done
+            if [ "${GET_SUCCESS}" = "true" ]; then
+              TOTAL=$(echo "${ALL_RELEASES}" | jq 'length')
+              echo "✅ 获取成功，共 ${TOTAL} 个本地 Release"; break
+            fi
+            echo "⚠️ 获取失败，第 ${i} 次整体重试..."
+            if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+          done
+
+          if [ "${GET_SUCCESS}" != "true" ]; then
+            echo "❌ 获取本地 Release 列表失败，跳过清理步骤"
+            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt; exit 0
+          fi
+
+          TOTAL_COUNT=$(echo "${ALL_RELEASES}" | jq 'length')
+          if [ "${TOTAL_COUNT}" -eq 0 ]; then echo "✅ 当前仓库没有任何 Release，无需清理"; exit 0; fi
+          echo "📌 当前仓库共有 ${TOTAL_COUNT} 个 Release"
+
+          if [ "${TOTAL_COUNT}" -le ${{ env.KEEP_LATEST_N_RELEASES }} ]; then
+            echo "✅ Release 数量未超过限制（${TOTAL_COUNT} ≤ ${{ env.KEEP_LATEST_N_RELEASES }}），无需清理"; exit 0
+          fi
+
+          DELETE_COUNT=$((TOTAL_COUNT - ${{ env.KEEP_LATEST_N_RELEASES }}))
+          echo "⚠️ 将删除最旧的 ${DELETE_COUNT} 个 Release"
+
+          TO_DELETE_TAGS=$(echo "${ALL_RELEASES}" \
+            | jq -r 'sort_by(.published_at) | reverse | .[].tag_name' \
+            | tail -n +$(( ${{ env.KEEP_LATEST_N_RELEASES }} + 1 )))
+
+          DELETED_COUNT=0; FAILED_DELETE_COUNT=0
+          while IFS= read -r tag; do
+            [ -z "${tag}" ] && continue
+            echo "----------------------------------------------"
+            echo "🗑️ 删除 Release：${tag}"
+            DELETE_SUCCESS=false
+            for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+              if gh release delete "${tag}" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null; then
+                DELETE_SUCCESS=true; break
+              fi
+              echo "⚠️ 删除失败，第 ${i} 次重试..."
+              if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
+            done
+            if [ "${DELETE_SUCCESS}" = "true" ]; then
+              echo "✅ Release ${tag} 已删除"; DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              echo "⚠️ gh CLI 删除失败，执行手动标签清理..."
+              git tag -d "${tag}" 2>/dev/null || true
+              for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
+                git push origin --delete "${tag}" 2>/dev/null && break; sleep 2
+              done
+              FAILED_DELETE_COUNT=$((FAILED_DELETE_COUNT + 1))
+            fi
+          done <<< "${TO_DELETE_TAGS}"
+
+          echo "=============================================="
+          echo "📊 旧 Releases 清理总结"
+          echo "=============================================="
+          echo "🗑️ 成功删除：${DELETED_COUNT} 个 Release"
+          echo "❌ 失败：    ${FAILED_DELETE_COUNT} 个 Release"
+          echo "=============================================="
+
+          if [ "${FAILED_DELETE_COUNT}" -gt 0 ]; then
+            echo $(( $(cat /tmp/error_count.txt) + FAILED_DELETE_COUNT )) > /tmp/error_count.txt
+          fi
+
+      # =========================================================================
+      # Step 6: 任务执行总结（始终执行）
+      # =========================================================================
+      - name: 📊 任务执行总结
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║         🎉 同步任务执行完成                   ║"
+          echo "╚══════════════════════════════════════════════╝"
+          echo ""
+
+          ERROR_COUNT=$(cat /tmp/error_count.txt 2>/dev/null || echo "0")
+          echo "📌 上游仓库：  ${{ env.UPSTREAM_REPO }}"
+          case "${{ env.SYNC_MODE }}" in
+            full)          echo "📌 同步模式：  完整同步（所有分支+标签+Releases）" ;;
+            main-only)     echo "📌 同步模式：  主分支同步（默认分支+标签+Releases）" ;;
+            releases-only) echo "📌 同步模式：  仅同步 Releases" ;;
+          esac
+          echo "📌 累计错误数：${ERROR_COUNT}"
+          echo "=============================================="
+
+          if [ "${ERROR_COUNT}" -eq 0 ]; then
+            echo "✅ 所有任务执行成功！"
+          else
+            echo "⚠️ 部分任务执行异常（错误数：${ERROR_COUNT}），请查看上方日志"
+            echo ""
+            echo "💡 常见问题排查："
+            echo "   1. 检查 SYNC_PAT 令牌权限是否正确（需要 repo + read:org）"
+            echo "   2. 检查 UPSTREAM_REPO 上游仓库地址是否正确"
+            echo "   3. 检查上游仓库是否有 Release 发布"
+            echo "   4. 开启 DEBUG=true 获取更详细的错误日志"
+            echo "   5. 尝试手动触发工作流（可选择不同同步模式）"
+            exit 1
+          fi
